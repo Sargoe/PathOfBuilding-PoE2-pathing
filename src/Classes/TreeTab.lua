@@ -160,6 +160,30 @@ function TreeTabClass:TreeTab(build)
 		main:OpenPopup(470, 100, "Reset Tree", controls, nil, "edit", "cancel")
 	end)
 
+	-- Optimize Pathing Button
+	self.controls.optimizePathing = new("ButtonControl"):ButtonControl({ "LEFT", self.controls.reset, "RIGHT" }, { 8, 0, 140, 20 }, "Optimize Pathing", function()
+		local controls = { }
+		local buttonY = 95
+		controls.warningLabel = new("LabelControl"):LabelControl(nil, { 0, 20, 0, 16 }, "^7This will reroute your passive tree to use the fewest points needed\n^7to reach your currently allocated notables, keystones, masteries and\n^7jewel sockets. Ascendancy nodes are left untouched. This cannot be undone.\n")
+		controls.optimize = new("ButtonControl"):ButtonControl(nil, { -65, buttonY, 100, 20 }, "Optimize", function()
+			if self.build.spec:OptimizePathing() then
+				self.build.spec:AddUndoState()
+				self.build.buildFlag = true
+			end
+			main:ClosePopup()
+		end)
+		controls.cancel = new("ButtonControl"):ButtonControl(nil, { 65, buttonY, 100, 20 }, "Cancel", function()
+			main:ClosePopup()
+		end)
+		main:OpenPopup(560, 130, "Optimize Pathing", controls, nil, "edit", "cancel")
+	end)
+	self.controls.optimizePathing.tooltipFunc = function(tooltip, mode, index, value)
+		tooltip:Clear()
+		tooltip:AddLine(16, "^7Recalculates the shortest paths needed to reach every notable, keystone,")
+		tooltip:AddLine(16, "^7mastery and jewel socket you currently have allocated on this tree,")
+		tooltip:AddLine(16, "^7dropping or rerouting any passives that aren't actually needed to connect them.")
+	end
+
 	-- Tree Version Dropdown
 	self.treeVersions = { }
 	for _, num in ipairs(treeVersionList) do
@@ -169,7 +193,7 @@ function TreeTabClass:TreeTab(build)
 		}
 		t_insert(self.treeVersions, value)
 	end
-	self.controls.versionText = new("LabelControl"):LabelControl({ "LEFT", self.controls.reset, "RIGHT" }, { 8, 0, 0, 16 }, "Version:")
+	self.controls.versionText = new("LabelControl"):LabelControl({ "LEFT", self.controls.optimizePathing, "RIGHT" }, { 8, 0, 0, 16 }, "Version:")
 	self.controls.versionSelect = new("DropDownControl"):DropDownControl({ "LEFT", self.controls.versionText, "RIGHT" }, { 8, 0, 60, 20 }, self.treeVersions, function(index, selected)
 		if selected.value ~= self.build.spec.treeVersion then
 			self:OpenVersionConvertPopup(selected.value, true)

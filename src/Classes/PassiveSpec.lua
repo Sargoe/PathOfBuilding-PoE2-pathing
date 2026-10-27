@@ -1059,6 +1059,87 @@ function PassiveSpecClass:DeallocNode(node)
 	self:BuildAllDependsAndPaths()
 end
 
+-- Recompute the main passive tree's pathing so that it connects the class start to every currently
+-- allocated notable/keystone/mastery/jewel socket using as few passive points as possible.
+-- Ascendancy nodes, weapon-set (alt-weapon) nodes and cluster jewel subgraphs are left untouched,
+-- as is anything granted without a path (e.g. Intuitive Leap-like radius jewels).
+-- Returns true if anything was (re)allocated, or false if there was nothing to optimize.
+function PassiveSpecClass:OptimizePathing()
+	local function isOptimizable(node)
+		-- Nodes with id >= 65536 belong to cluster jewel subgraphs, which have their own separate
+		-- pathing root (the jewel socket) and are left alone here.
+		return node.id < 65536 and not node.ascendancyName and (node.allocMode or 0) == 0
+			and #node.intuitiveLeapLikesAffecting == 0 and node.type ~= "ClassStart" and node.type ~= "AscendClassStart"
+	end
+
+	-- The "desired" nodes are the ones actually worth pathing to; plain Normal passives are just filler
+	-- that the pathing is free to re-route or drop entirely.
+	local desired = { }
+	for id, node in pairs(self.allocNodes) do
+		if isOptimizable(node) and node.type ~= "Normal" then
+			t_insert(desired, node)
+		end
+	end
+	if #desired == 0 then
+		return false
+	end
+
+	-- Preserve mastery effect selections; they'll be wiped as their nodes are deallocated below, but we
+	-- want to restore them once the corresponding mastery nodes are reallocated.
+	local savedMasterySelections = { }
+	for id, effect in pairs(self.masterySelections) do
+		savedMasterySelections[id] = effect
+	end
+
+	-- Clear every node this function is allowed to touch (filler and desired alike) so the tree can be
+	-- rebuilt from scratch using only the shortest available routes.
+	local toClear = { }
+	for id, node in pairs(self.allocNodes) do
+		if isOptimizable(node) then
+			t_insert(toClear, node)
+		end
+	end
+	for _, node in ipairs(toClear) do
+		node.alloc = false
+		self.allocNodes[node.id] = nil
+		if node.isAttribute then
+			self.hashOverrides[node.id] = nil
+		end
+	end
+	wipeTable(self.masterySelections)
+	self:BuildAllDependsAndPaths()
+
+	-- Greedily reconnect the desired nodes, always taking whichever one is currently closest to the
+	-- (growing) tree next. This is a standard nearest-insertion approximation of a minimal Steiner tree,
+	-- and reuses the same path (node.path) that BuildAllDependsAndPaths already maintains for every node.
+	local remaining = desired
+	while #remaining > 0 do
+		local bestIndex, bestNode, bestLength
+		for index, node in ipairs(remaining) do
+			local path = node.path
+			if path and (not bestLength or #path < bestLength) then
+				bestIndex, bestNode, bestLength = index, node, #path
+			end
+		end
+		if not bestNode then
+			-- Shouldn't happen in practice: every desired node was reachable before we cleared the tree.
+			break
+		end
+		self:AllocNode(bestNode)
+		t_remove(remaining, bestIndex)
+	end
+
+	-- Restore mastery effect selections for any mastery nodes that made it back onto the tree.
+	for id, effect in pairs(savedMasterySelections) do
+		if self.allocNodes[id] then
+			self.masterySelections[id] = effect
+		end
+	end
+	self:BuildAllDependsAndPaths()
+
+	return true
+end
+
 -- Count the number of allocated nodes and allocated ascendancy nodes
 function PassiveSpecClass:CountAllocNodes()
 	local used, ascUsed, secondaryAscUsed, sockets, weaponSet1Used, weaponSet2Used = 0, 0, 0, 0, 0, 0
