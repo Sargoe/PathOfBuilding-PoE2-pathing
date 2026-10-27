@@ -41,6 +41,7 @@ function TreeTabClass:TreeTab(build)
 	self.build = build
 	self.isComparing = false;
 	self.isCustomMaxDepth = false;
+	self.maxDpsCoroutine = nil
 
 	self.viewer = new("PassiveTreeView"):PassiveTreeView()
 
@@ -184,6 +185,40 @@ function TreeTabClass:TreeTab(build)
 		tooltip:AddLine(16, "^7possible. Every other allocated node is left exactly as it is.")
 	end
 
+	-- Max DPS Button
+	self.controls.maxDps = new("ButtonControl"):ButtonControl({ "LEFT", self.controls.optimizePathing, "RIGHT" }, { 8, 0, 90, 20 }, "Max DPS", function()
+		if self.maxDpsCoroutine then
+			return
+		end
+		local controls = { }
+		local buttonY = 115
+		controls.warningLabel = new("LabelControl"):LabelControl(nil, { 0, 20, 0, 16 },
+			"^7This clears and rebuilds your ENTIRE passive tree from scratch, trying to spend your\n" ..
+			"^7current points for the highest possible Hit Damage, while still meeting the Strength/\n" ..
+			"^7Dexterity/Intelligence requirements of your items and gems (a few extra points may be\n" ..
+			"^7spent if needed to meet them). Ascendancy nodes, alt-weapon-set nodes and jewel sockets\n" ..
+			"^7that already hold a jewel are left untouched.\n\n" ..
+			"^1This is a heavy calculation and can take several minutes. This cannot be undone.\n")
+		controls.optimize = new("ButtonControl"):ButtonControl(nil, { -65, buttonY, 100, 20 }, "Optimize", function()
+			self:StartMaxDpsOptimization()
+			main:ClosePopup()
+		end)
+		controls.cancel = new("ButtonControl"):ButtonControl(nil, { 65, buttonY, 100, 20 }, "Cancel", function()
+			main:ClosePopup()
+		end)
+		main:OpenPopup(620, 170, "Maximize Hit Damage", controls, nil, "edit", "cancel")
+	end)
+	self.controls.maxDps.tooltipFunc = function(tooltip, mode, index, value)
+		tooltip:Clear()
+		if self.maxDpsCoroutine then
+			tooltip:AddLine(16, "^7Already running...")
+			return
+		end
+		tooltip:AddLine(16, "^7Clears and rebuilds your entire passive tree to maximize Hit Damage within your")
+		tooltip:AddLine(16, "^7current point total, while still meeting the attribute requirements of your gear")
+		tooltip:AddLine(16, "^7and gems. This is a heavy calculation and can take several minutes.")
+	end
+
 	-- Tree Version Dropdown
 	self.treeVersions = { }
 	for _, num in ipairs(treeVersionList) do
@@ -193,7 +228,7 @@ function TreeTabClass:TreeTab(build)
 		}
 		t_insert(self.treeVersions, value)
 	end
-	self.controls.versionText = new("LabelControl"):LabelControl({ "LEFT", self.controls.optimizePathing, "RIGHT" }, { 8, 0, 0, 16 }, "Version:")
+	self.controls.versionText = new("LabelControl"):LabelControl({ "LEFT", self.controls.maxDps, "RIGHT" }, { 8, 0, 0, 16 }, "Version:")
 	self.controls.versionSelect = new("DropDownControl"):DropDownControl({ "LEFT", self.controls.versionText, "RIGHT" }, { 8, 0, 60, 20 }, self.treeVersions, function(index, selected)
 		if selected.value ~= self.build.spec.treeVersion then
 			self:OpenVersionConvertPopup(selected.value, true)
@@ -376,6 +411,10 @@ function TreeTabClass:Draw(viewPort, inputEvents)
 	self.anchorControls.x = viewPort.x + 4
 	self.anchorControls.y = viewPort.y + viewPort.height - 24
 
+	if self.maxDpsCoroutine then
+		self:StepMaxDpsOptimization()
+	end
+
 	for id, event in ipairs(inputEvents) do
 		if event.type == "KeyDown" then
 			if event.key == "z" and IsKeyDown("CTRL") then
@@ -413,6 +452,8 @@ function TreeTabClass:Draw(viewPort, inputEvents)
 	local widthFirstLineControls = self.controls.specSelect.width + 8
 								+ self.controls.compareCheck.width + self.controls.compareCheck.x
 								+ self.controls.reset.width + self.controls.reset.x
+								+ self.controls.optimizePathing.width + self.controls.optimizePathing.x
+								+ self.controls.maxDps.width + self.controls.maxDps.x
 								+ self.controls.versionText.width() + self.controls.versionText.x
 								+ self.controls.versionSelect.width + self.controls.versionSelect.x
 								+ (self.isComparing and (self.controls.compareSelect.width + self.controls.compareSelect.x) or 0)
@@ -942,6 +983,51 @@ function TreeTabClass:OpenMasteryPopup(node, viewPort)
 		end)
 		controls.effect = new("PassiveMasteryControl"):PassiveMasteryControl({ "TOPLEFT", nil, "TOPLEFT" }, { 6, 25, 0, passiveMasteryControlHeight }, effects, self, node, controls.save)
 		main:OpenPopup(controls.effect.width + 12, controls.effect.height + 60, node.name, controls)
+	end
+end
+
+-- Kicks off PassiveSpecClass:MaximizeHitDamage() as a background coroutine; StepMaxDpsOptimization()
+-- (driven from Draw() every frame) advances it a bit at a time so the UI stays responsive.
+function TreeTabClass:StartMaxDpsOptimization()
+	if self.maxDpsCoroutine then
+		return
+	end
+	self.maxDpsCoroutine = coroutine.create(self.build.spec.MaximizeHitDamage)
+	t_insert(main.toastMessages, "Maximizing Hit Damage...")
+end
+
+function TreeTabClass:StepMaxDpsOptimization()
+	if not self.maxDpsCoroutine then
+		return
+	end
+	local progressMessage
+	local res, errMsg = coroutine.resume(self.maxDpsCoroutine, self.build.spec, function(message)
+		progressMessage = message
+	end)
+	if launch.devMode and not res then
+		error(errMsg)
+	end
+	if progressMessage then
+		local toastIndex = findToastIndex("^Maximizing Hit Damage")
+		if toastIndex then
+			main.toastMessages[toastIndex] = progressMessage
+		end
+	end
+	if coroutine.status(self.maxDpsCoroutine) == "dead" then
+		self.maxDpsCoroutine = nil
+		local toastIndex = findToastIndex("^Maximizing Hit Damage")
+		if toastIndex then
+			if toastIndex == 1 then
+				main.toastMode = "HIDING"
+				main.toastStart = GetTime()
+			else
+				t_remove(main.toastMessages, toastIndex)
+			end
+		end
+		if res then
+			self.build.spec:AddUndoState()
+			self.build.buildFlag = true
+		end
 	end
 end
 

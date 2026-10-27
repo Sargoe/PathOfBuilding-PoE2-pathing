@@ -1244,6 +1244,271 @@ function PassiveSpecClass:OptimizePathing()
 	return true
 end
 
+-- ---------------------------------------------------------------------------------------------------
+-- "Maximize Hit Damage": clears and rebuilds the entire main passive tree from scratch, spending the
+-- same number of points currently allocated, to approximately maximize Hit DPS while still meeting the
+-- Strength/Dexterity/Intelligence requirements of equipped items and skill gems.
+--
+-- This is a best-effort heuristic, not an exact solver (choosing the truly optimal subset of a ~1500+
+-- node graph under a point budget is an NP-hard Steiner-tree/knapsack problem). It uses a greedy
+-- "best Hit DPS gained per point spent" construction: repeatedly find whichever reachable node (and the
+-- path needed to reach it) currently offers the best value-per-point, allocate it for real, and recompute
+-- from there, since allocating one node changes what every other node is worth (diminishing returns,
+-- threshold effects, etc). This is the same greedy approach used for 0/1 knapsack approximations, applied
+-- here on top of the tree's own pathing cost.
+-- ---------------------------------------------------------------------------------------------------
+
+-- Returns true if the given node must stay exactly as it currently is during MaximizeHitDamage:
+-- ascendancy nodes, weapon-set (alt-weapon) nodes, cluster jewel subgraphs, the class start, anything
+-- granted without a path (e.g. Intuitive Leap-like radius jewels), and jewel sockets that currently
+-- have a jewel socketed (so the jewel keeps working).
+function PassiveSpecClass:IsMaxDpsLocked(node)
+	if node.ascendancyName or (node.allocMode or 0) ~= 0 or node.id >= 65536
+		or #node.intuitiveLeapLikesAffecting > 0 or node.type == "ClassStart" or node.type == "AscendClassStart" then
+		return true
+	end
+	if node.type == "Socket" and self.jewels[node.id] and self.jewels[node.id] > 0 then
+		return true
+	end
+	return false
+end
+
+-- Evaluates every effect option of a currently unallocated mastery node and returns the id and Hit DPS
+-- *gain* (relative to calcBase, the output without this node) of the best one. Masteries can't be
+-- evaluated through the normal node-power machinery because, without an explicit selection, a mastery
+-- node's mods represent ALL of its options shown together (for tooltip purposes) rather than any one
+-- real choice.
+local function bestMasteryEffectForHitDps(self, node, calcFunc, calcBase)
+	if not node.masteryEffects or #node.masteryEffects == 0 then
+		return nil
+	end
+	local hitDpsStat = { stat = "TotalDPS" }
+	local baseDps = data.powerStatList.GetFromOutput(calcBase, hitDpsStat)
+	local bestEffectId, bestDps
+	for _, effectRef in ipairs(node.masteryEffects) do
+		local effect = self.tree.masteryEffects[effectRef.effect]
+		if effect then
+			node.sd = copyTable(effect.sd)
+			self.tree:ProcessStats(node)
+			local output = calcFunc({ addNodes = { [node] = true } }, false)
+			local dps = data.powerStatList.GetFromOutput(output, hitDpsStat) - baseDps
+			if not bestDps or dps > bestDps then
+				bestDps, bestEffectId = dps, effectRef.effect
+			end
+		end
+	end
+	if bestEffectId then
+		return bestEffectId, bestDps
+	end
+	return nil
+end
+
+-- Allocates the fewest possible extra attribute nodes needed to bring Strength/Dexterity/Intelligence
+-- up to the given requirements (from equipped items and skill gems). This may add points beyond
+-- whatever budget the caller had in mind: meeting equipment and gem requirements takes priority over
+-- an exact point count, since an unmet requirement makes the build non-functional.
+function PassiveSpecClass:FixAttributeRequirements(reqStr, reqDex, reqInt, progressCallback)
+	local calcsTab = self.build.calcsTab
+	local attributeStatByIndex = { "Str", "Dex", "Int" }
+	local reqByIndex = { reqStr or 0, reqDex or 0, reqInt or 0 }
+
+	for attributeIndex = 1, 3 do
+		local guard = 0
+		while guard < 40 do
+			guard = guard + 1
+			calcsTab:BuildOutput()
+			local have = calcsTab.mainOutput[attributeStatByIndex[attributeIndex]] or 0
+			if have >= reqByIndex[attributeIndex] then
+				break
+			end
+			self:BuildAllDependsAndPaths()
+			-- Find the closest unallocated, in-scope attribute node to press into service.
+			local bestNode, bestPathLength
+			for id, node in pairs(self.nodes) do
+				if not node.alloc and node.isAttribute and not self:IsMaxDpsLocked(node) and node.path
+					and not node.ascendancyName and (node.allocMode or 0) == 0 and node.id < 65536 then
+					if not bestPathLength or #node.path < bestPathLength then
+						bestNode, bestPathLength = node, #node.path
+					end
+				end
+			end
+			if not bestNode then
+				-- No more attribute nodes reachable; can't fully satisfy this requirement.
+				break
+			end
+			for _, pathNode in ipairs(bestNode.path) do
+				pathNode.alloc = true
+				pathNode.allocMode = 0
+				self.allocNodes[pathNode.id] = pathNode
+				if pathNode.isAttribute and pathNode ~= bestNode then
+					self:SwitchAttributeNode(pathNode.id, self.attributeIndex or 1)
+				end
+			end
+			self:SwitchAttributeNode(bestNode.id, attributeIndex)
+			self:BuildAllDependsAndPaths()
+			if progressCallback then
+				progressCallback("Maximizing Hit Damage... (meeting attribute requirements)")
+			end
+			if coroutine.running() then
+				coroutine.yield()
+			end
+		end
+	end
+end
+
+-- Clears and rebuilds the main passive tree from scratch to approximately maximize Hit DPS within the
+-- same number of points currently spent, while still meeting the Strength/Dexterity/Intelligence
+-- requirements of equipped items and skill gems. Ascendancy nodes, weapon-set nodes, cluster jewel
+-- subgraphs and jewel sockets with a jewel already socketed are left exactly as they are.
+--
+-- This can take a long time on a large tree (it's doing full DPS recalculations in a loop): call it
+-- from inside a coroutine (it yields periodically on its own, and through BuildPower's internals) and
+-- drive it with repeated coroutine.resume() calls, similar to CalcsTabClass:BuildPower().
+-- `progressCallback(message)`, if given, is called periodically with a status string.
+-- Returns true if anything was changed, or false if there was nothing to optimize.
+function PassiveSpecClass:MaximizeHitDamage(progressCallback)
+	local calcsTab = self.build.calcsTab
+	local function yield()
+		if coroutine.running() then
+			coroutine.yield()
+		end
+	end
+
+	-- Make sure the calculator reflects the spec as it stands right now, and capture the attribute
+	-- requirements from equipped items/gems before we start changing anything (these don't depend on
+	-- the passive tree, so they won't change as we go).
+	calcsTab:BuildOutput()
+	local reqStr = calcsTab.mainOutput.ReqStr or 0
+	local reqDex = calcsTab.mainOutput.ReqDex or 0
+	local reqInt = calcsTab.mainOutput.ReqInt or 0
+
+	-- Search the full tree regardless of the heat map's own depth-limit setting, and restore it after.
+	local savedMaxDepth = calcsTab.nodePowerMaxDepth
+	local savedPowerStat = calcsTab.powerStat
+	calcsTab.nodePowerMaxDepth = nil
+	local hitDpsStat = { stat = "TotalDPS" }
+
+	-- Points currently spent on nodes we're allowed to touch; this is our budget.
+	local pointsAvailable = 0
+	for id, node in pairs(self.allocNodes) do
+		if not self:IsMaxDpsLocked(node) then
+			pointsAvailable = pointsAvailable + 1
+		end
+	end
+	if pointsAvailable == 0 then
+		calcsTab.nodePowerMaxDepth = savedMaxDepth
+		calcsTab.powerStat = savedPowerStat
+		return false
+	end
+
+	-- Clear every node we're allowed to touch.
+	local toClear = { }
+	for id, node in pairs(self.allocNodes) do
+		if not self:IsMaxDpsLocked(node) then
+			t_insert(toClear, node)
+		end
+	end
+	for _, node in ipairs(toClear) do
+		node.alloc = false
+		self.allocNodes[node.id] = nil
+		if node.isAttribute then
+			self.hashOverrides[node.id] = nil
+		end
+		if node.type == "Mastery" then
+			self.masterySelections[node.id] = nil
+		end
+	end
+	self:BuildAllDependsAndPaths()
+	yield()
+
+	-- Main greedy loop: each pass, find whichever reachable node currently offers the best Hit DPS
+	-- gained per point spent on the path to it, allocate it for real, then recompute and repeat. This
+	-- always terminates within at most `pointsAvailable` passes, since every accepted node costs at
+	-- least one point.
+	local pointsSpent = 0
+	while pointsSpent < pointsAvailable do
+		calcsTab:BuildOutput()
+		local calcFunc, calcBase = calcsTab:GetMiscCalculator()
+		calcsTab.powerStat = hitDpsStat
+		calcsTab:PowerBuilder() -- populates node.power.pathPower for every other reachable unallocated node
+		yield()
+
+		local pointsRemaining = pointsAvailable - pointsSpent
+		local bestNode, bestDensity, bestMasteryChoice, bestPathLength
+
+		-- Mastery nodes need their own evaluation (see bestMasteryEffectForHitDps); cap how many are
+		-- considered per pass to keep this from blowing out the already-expensive outer loop.
+		local masteryCandidates, masteryCandidateCount = { }, 0
+		for id, node in pairs(self.nodes) do
+			if not node.alloc and node.type == "Mastery" and not self:IsMaxDpsLocked(node) and node.path
+				and #node.path <= pointsRemaining and not node.ascendancyName and (node.allocMode or 0) == 0 and node.id < 65536 then
+				t_insert(masteryCandidates, node)
+			end
+		end
+		table.sort(masteryCandidates, function(a, b) return #a.path < #b.path end)
+		for _, node in ipairs(masteryCandidates) do
+			if masteryCandidateCount >= 15 then
+				break
+			end
+			masteryCandidateCount = masteryCandidateCount + 1
+			local effectId, dps = bestMasteryEffectForHitDps(self, node, calcFunc, calcBase)
+			if effectId and dps and dps > 0 then
+				local density = dps / #node.path
+				if not bestDensity or density > bestDensity then
+					bestNode, bestDensity, bestMasteryChoice, bestPathLength = node, density, effectId, #node.path
+				end
+			end
+			yield()
+		end
+
+		for id, node in pairs(self.nodes) do
+			if not node.alloc and node.type ~= "Mastery" and not self:IsMaxDpsLocked(node) and node.path
+				and #node.path <= pointsRemaining and #node.path > 0 and not node.ascendancyName and (node.allocMode or 0) == 0 and node.id < 65536
+				and node.power and node.power.pathPower and node.power.pathPower > 0 then
+				local density = node.power.pathPower / #node.path
+				if not bestDensity or density > bestDensity then
+					bestNode, bestDensity, bestMasteryChoice, bestPathLength = node, density, nil, #node.path
+				end
+			end
+		end
+
+		if not bestNode then
+			break -- nothing reachable within budget is worth taking any more
+		end
+
+		-- Allocate the full path to the chosen node.
+		for _, pathNode in ipairs(bestNode.path) do
+			pathNode.alloc = true
+			pathNode.allocMode = 0
+			self.allocNodes[pathNode.id] = pathNode
+			if pathNode.isAttribute then
+				self:SwitchAttributeNode(pathNode.id, self.attributeIndex or 1)
+			end
+		end
+		if bestMasteryChoice then
+			self.masterySelections[bestNode.id] = bestMasteryChoice
+		end
+		pointsSpent = pointsSpent + bestPathLength
+		self:BuildAllDependsAndPaths()
+
+		if progressCallback then
+			progressCallback(string.format("Maximizing Hit Damage... (%d/%d points)", pointsSpent, pointsAvailable))
+		end
+		yield()
+	end
+
+	-- Make sure attribute requirements from items/gems are still met; this can add a few points beyond
+	-- the original budget if the DPS-focused pass above didn't happen to cover them.
+	self:FixAttributeRequirements(reqStr, reqDex, reqInt, progressCallback)
+
+	calcsTab.nodePowerMaxDepth = savedMaxDepth
+	calcsTab.powerStat = savedPowerStat
+	calcsTab.powerBuildFlag = true
+	self:BuildAllDependsAndPaths()
+
+	return true
+end
+
 -- Count the number of allocated nodes and allocated ascendancy nodes
 function PassiveSpecClass:CountAllocNodes()
 	local used, ascUsed, secondaryAscUsed, sockets, weaponSet1Used, weaponSet2Used = 0, 0, 0, 0, 0, 0
