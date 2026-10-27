@@ -1091,6 +1091,17 @@ function PassiveSpecClass:OptimizePathing()
 		savedMasterySelections[id] = effect
 	end
 
+	-- Preserve each attribute node's chosen attribute (Strength/Dexterity/Intelligence). Reallocating a
+	-- path node otherwise defaults every attribute node to whichever attribute was last picked manually
+	-- (self.attributeIndex), so without this every attribute passive would collapse onto the same stat.
+	local attributeIndexByName = { Strength = 1, Dexterity = 2, Intelligence = 3 }
+	local savedAttributeChoices = { }
+	for id, node in pairs(self.allocNodes) do
+		if node.isAttribute and attributeIndexByName[node.dn] then
+			savedAttributeChoices[id] = attributeIndexByName[node.dn]
+		end
+	end
+
 	-- Clear every node this function is allowed to touch (filler and desired alike) so the tree can be
 	-- rebuilt from scratch using only the shortest available routes.
 	local toClear = { }
@@ -1135,6 +1146,15 @@ function PassiveSpecClass:OptimizePathing()
 			self.masterySelections[id] = effect
 		end
 	end
+
+	-- Restore each attribute node's original attribute choice, for any that made it back onto the tree
+	-- (an attribute node not needed to connect anything desired will simply have been dropped).
+	for id, attributeIndex in pairs(savedAttributeChoices) do
+		if self.allocNodes[id] then
+			self:SwitchAttributeNode(id, attributeIndex)
+		end
+	end
+
 	self:BuildAllDependsAndPaths()
 
 	return true
