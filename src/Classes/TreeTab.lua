@@ -164,7 +164,7 @@ function TreeTabClass:TreeTab(build)
 	self.controls.optimizePathing = new("ButtonControl"):ButtonControl({ "LEFT", self.controls.reset, "RIGHT" }, { 8, 0, 140, 20 }, "Optimize Pathing", function()
 		local controls = { }
 		local buttonY = 95
-		controls.warningLabel = new("LabelControl"):LabelControl(nil, { 0, 20, 0, 16 }, "^7This will reroute your passive tree to use the fewest points needed\n^7to reach your currently allocated notables, keystones, masteries and\n^7jewel sockets. Ascendancy nodes are left untouched. This cannot be undone.\n")
+		controls.warningLabel = new("LabelControl"):LabelControl(nil, { 0, 20, 0, 16 }, "^7This will recalculate which attribute passives (Strength/Dexterity/Intelligence)\n^7are used to connect your tree, using as few as possible. Every other allocated\n^7node is left exactly as it is. Ascendancy nodes are untouched. This cannot be undone.\n")
 		controls.optimize = new("ButtonControl"):ButtonControl(nil, { -65, buttonY, 100, 20 }, "Optimize", function()
 			if self.build.spec:OptimizePathing() then
 				self.build.spec:AddUndoState()
@@ -179,9 +179,9 @@ function TreeTabClass:TreeTab(build)
 	end)
 	self.controls.optimizePathing.tooltipFunc = function(tooltip, mode, index, value)
 		tooltip:Clear()
-		tooltip:AddLine(16, "^7Recalculates the shortest paths needed to reach every notable, keystone,")
-		tooltip:AddLine(16, "^7mastery and jewel socket you currently have allocated on this tree,")
-		tooltip:AddLine(16, "^7dropping or rerouting any passives that aren't actually needed to connect them.")
+		tooltip:AddLine(16, "^7Recalculates which attribute passives (Strength/Dexterity/Intelligence) are used")
+		tooltip:AddLine(16, "^7to connect your currently allocated nodes to the class start, using as few as")
+		tooltip:AddLine(16, "^7possible. Every other allocated node is left exactly as it is.")
 	end
 
 	-- Tree Version Dropdown

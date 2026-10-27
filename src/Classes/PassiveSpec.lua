@@ -1059,96 +1059,180 @@ function PassiveSpecClass:DeallocNode(node)
 	self:BuildAllDependsAndPaths()
 end
 
--- Recompute the main passive tree's pathing so that it connects the class start to every currently
--- allocated notable/keystone/mastery/jewel socket using as few passive points as possible.
--- Ascendancy nodes, weapon-set (alt-weapon) nodes and cluster jewel subgraphs are left untouched,
--- as is anything granted without a path (e.g. Intuitive Leap-like radius jewels).
--- Returns true if anything was (re)allocated, or false if there was nothing to optimize.
+-- Recompute the placement of attribute (Strength/Dexterity/Intelligence) passives on the main tree so
+-- that they connect every other currently allocated node to the class start using as few of them as
+-- possible. Attribute nodes are the only ones this function may add, remove or reroute; every other
+-- currently allocated node (notables, keystones, masteries, jewel sockets, and plain passives alike)
+-- is treated as essential and is left exactly as it is. Ascendancy nodes, weapon-set (alt-weapon) nodes
+-- and cluster jewel subgraphs are also left untouched, as is anything granted without a path
+-- (e.g. Intuitive Leap-like radius jewels).
+-- Returns true if anything was changed, or false if there was nothing to optimize.
 function PassiveSpecClass:OptimizePathing()
-	local function isOptimizable(node)
+	local function inScope(node)
 		-- Nodes with id >= 65536 belong to cluster jewel subgraphs, which have their own separate
 		-- pathing root (the jewel socket) and are left alone here.
 		return node.id < 65536 and not node.ascendancyName and (node.allocMode or 0) == 0
 			and #node.intuitiveLeapLikesAffecting == 0 and node.type ~= "ClassStart" and node.type ~= "AscendClassStart"
 	end
 
-	-- The "desired" nodes are the ones actually worth pathing to; plain Normal passives are just filler
-	-- that the pathing is free to re-route or drop entirely.
-	local desired = { }
+	-- Collect the in-scope attribute nodes that are currently allocated; these are the only nodes this
+	-- function is allowed to touch.
+	local attributeNodes = { }
 	for id, node in pairs(self.allocNodes) do
-		if isOptimizable(node) and node.type ~= "Normal" then
-			t_insert(desired, node)
+		if inScope(node) and node.isAttribute then
+			t_insert(attributeNodes, node)
 		end
 	end
-	if #desired == 0 then
+	if #attributeNodes == 0 then
 		return false
 	end
 
-	-- Preserve mastery effect selections; they'll be wiped as their nodes are deallocated below, but we
-	-- want to restore them once the corresponding mastery nodes are reallocated.
-	local savedMasterySelections = { }
-	for id, effect in pairs(self.masterySelections) do
-		savedMasterySelections[id] = effect
-	end
-
-	-- Preserve each attribute node's chosen attribute (Strength/Dexterity/Intelligence). Reallocating a
-	-- path node otherwise defaults every attribute node to whichever attribute was last picked manually
-	-- (self.attributeIndex), so without this every attribute passive would collapse onto the same stat.
+	-- Preserve each attribute node's chosen attribute, so that any which end up back on the tree keep
+	-- their original Strength/Dexterity/Intelligence choice rather than defaulting to whichever
+	-- attribute was last picked manually (self.attributeIndex).
 	local attributeIndexByName = { Strength = 1, Dexterity = 2, Intelligence = 3 }
 	local savedAttributeChoices = { }
-	for id, node in pairs(self.allocNodes) do
-		if node.isAttribute and attributeIndexByName[node.dn] then
-			savedAttributeChoices[id] = attributeIndexByName[node.dn]
+	for _, node in ipairs(attributeNodes) do
+		if attributeIndexByName[node.dn] then
+			savedAttributeChoices[node.id] = attributeIndexByName[node.dn]
 		end
 	end
 
-	-- Clear every node this function is allowed to touch (filler and desired alike) so the tree can be
-	-- rebuilt from scratch using only the shortest available routes.
-	local toClear = { }
-	for id, node in pairs(self.allocNodes) do
-		if isOptimizable(node) then
-			t_insert(toClear, node)
-		end
-	end
-	for _, node in ipairs(toClear) do
+	-- Deallocate every in-scope attribute node; everything else stays allocated exactly as it is.
+	for _, node in ipairs(attributeNodes) do
 		node.alloc = false
 		self.allocNodes[node.id] = nil
-		if node.isAttribute then
-			self.hashOverrides[node.id] = nil
-		end
+		self.hashOverrides[node.id] = nil
 	end
-	wipeTable(self.masterySelections)
-	self:BuildAllDependsAndPaths()
 
-	-- Greedily reconnect the desired nodes, always taking whichever one is currently closest to the
-	-- (growing) tree next. This is a standard nearest-insertion approximation of a minimal Steiner tree,
-	-- and reuses the same path (node.path) that BuildAllDependsAndPaths already maintains for every node.
-	local remaining = desired
-	while #remaining > 0 do
-		local bestIndex, bestNode, bestLength
-		for index, node in ipairs(remaining) do
-			local path = node.path
-			if path and (not bestLength or #path < bestLength) then
-				bestIndex, bestNode, bestLength = index, node, #path
+	-- Find which of the remaining allocated nodes are still actually connected to the class start now
+	-- that those attribute nodes are gone, walking only through other already-allocated nodes.
+	local function findReachable()
+		local reach = { }
+		local queue = { }
+		for id, node in pairs(self.allocNodes) do
+			if node.type == "ClassStart" then
+				reach[node] = true
+				t_insert(queue, node)
 			end
 		end
-		if not bestNode then
-			-- Shouldn't happen in practice: every desired node was reachable before we cleared the tree.
-			break
+		local o = 1
+		while queue[o] do
+			local node = queue[o]
+			o = o + 1
+			for _, other in ipairs(node.linked) do
+				if self.allocNodes[other.id] and not reach[other] and other.type ~= "AscendClassStart"
+					and (node.ascendancyName == other.ascendancyName or not other.ascendancyName) then
+					reach[other] = true
+					t_insert(queue, other)
+				end
+			end
 		end
-		self:AllocNode(bestNode)
-		t_remove(remaining, bestIndex)
+		return reach
+	end
+	local reachable = findReachable()
+
+	-- Any in-scope node that's still allocated but not reachable lost its only connection when we
+	-- removed its attribute node(s), and needs to be reconnected using only (newly allocated) attribute
+	-- nodes as connectors; every already-allocated node is a free pass-through.
+	local orphaned = { }
+	local orphanCount = 0
+	for id, node in pairs(self.allocNodes) do
+		if inScope(node) and not reachable[node] then
+			orphaned[node] = true
+			orphanCount = orphanCount + 1
+		end
 	end
 
-	-- Restore mastery effect selections for any mastery nodes that made it back onto the tree.
-	for id, effect in pairs(savedMasterySelections) do
-		if self.allocNodes[id] then
-			self.masterySelections[id] = effect
+	-- 0-1 BFS from the reachable set to the nearest orphan, where passing through an already-allocated
+	-- node is free and passing through an unallocated in-scope attribute node costs one point; nothing
+	-- else may be used as a connector.
+	local function findReconnectPath()
+		local visited = { }
+		local prev = { }
+		local dq = { }
+		local qs, qe = 1, 0
+		for node in pairs(reachable) do
+			visited[node] = true
+			qe = qe + 1
+			dq[qe] = node
+		end
+		while qs <= qe do
+			local node = dq[qs]
+			qs = qs + 1
+			if orphaned[node] then
+				local path = { }
+				local current = node
+				while current and prev[current] do
+					t_insert(path, current)
+					current = prev[current]
+				end
+				return path
+			end
+			if node.unlockConstraint then
+				for _, nodeId in ipairs(node.unlockConstraint.nodes) do
+					if not self.nodes[nodeId].alloc then
+						goto continueReconnect
+					end
+				end
+			end
+			for _, other in ipairs(node.linked) do
+				if not visited[other] and other.type ~= "Mastery" and other.type ~= "ClassStart" and other.type ~= "AscendClassStart"
+					and (node.ascendancyName == other.ascendancyName or not other.ascendancyName)
+					and (self.allocNodes[other.id] or (other.isAttribute and inScope(other))) then
+					local unlockOk = true
+					if other.unlockConstraint then
+						for _, nodeId in ipairs(other.unlockConstraint.nodes) do
+							if not self.nodes[nodeId].alloc then
+								unlockOk = false
+								break
+							end
+						end
+					end
+					if unlockOk then
+						visited[other] = true
+						prev[other] = node
+						if self.allocNodes[other.id] then
+							-- Free hop: process before anything that costs a point.
+							qs = qs - 1
+							dq[qs] = other
+						else
+							qe = qe + 1
+							dq[qe] = other
+						end
+					end
+				end
+			end
+			::continueReconnect::
+		end
+		return nil
+	end
+
+	while orphanCount > 0 do
+		local path = findReconnectPath()
+		if not path then
+			-- Shouldn't happen in practice: every orphaned node was reachable before we cleared the tree.
+			break
+		end
+		for _, pathNode in ipairs(path) do
+			if not self.allocNodes[pathNode.id] then
+				pathNode.alloc = true
+				pathNode.allocMode = 0
+				self.allocNodes[pathNode.id] = pathNode
+				if pathNode.isAttribute then
+					self:SwitchAttributeNode(pathNode.id, self.attributeIndex or 1)
+				end
+			end
+			reachable[pathNode] = true
+			if orphaned[pathNode] then
+				orphaned[pathNode] = nil
+				orphanCount = orphanCount - 1
+			end
 		end
 	end
 
 	-- Restore each attribute node's original attribute choice, for any that made it back onto the tree
-	-- (an attribute node not needed to connect anything desired will simply have been dropped).
+	-- (an attribute node not needed to connect anything will simply have been dropped).
 	for id, attributeIndex in pairs(savedAttributeChoices) do
 		if self.allocNodes[id] then
 			self:SwitchAttributeNode(id, attributeIndex)
