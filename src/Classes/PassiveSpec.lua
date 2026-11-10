@@ -1278,7 +1278,7 @@ end
 -- evaluated through the normal node-power machinery because, without an explicit selection, a mastery
 -- node's mods represent ALL of its options shown together (for tooltip purposes) rather than any one
 -- real choice.
-local function bestMasteryEffectForHitDps(self, node, calcFunc, calcBase)
+local function bestMasteryEffectForHitDps(self, node, calcFunc, calcBase, fastCalcOptions)
 	if not node.masteryEffects or #node.masteryEffects == 0 then
 		return nil
 	end
@@ -1290,7 +1290,7 @@ local function bestMasteryEffectForHitDps(self, node, calcFunc, calcBase)
 		if effect then
 			node.sd = copyTable(effect.sd)
 			self.tree:ProcessStats(node)
-			local output = calcFunc({ addNodes = { [node] = true } }, false)
+			local output = calcFunc({ addNodes = { [node] = true } }, false, fastCalcOptions)
 			local dps = data.powerStatList.GetFromOutput(output, hitDpsStat) - baseDps
 			if not bestDps or dps > bestDps then
 				bestDps, bestEffectId = dps, effectRef.effect
@@ -1438,6 +1438,11 @@ function PassiveSpecClass:MaximizeHitDamage(progressCallback)
 		calcsTab:PowerBuilder() -- populates node.power.pathPower for every reachable-within-budget unallocated node
 		yield()
 
+		-- Items/gems don't change between candidates below either, so warm up the same accelerated
+		-- environment PowerBuilder just used instead of rebuilding them from scratch again. `skills`
+		-- stays un-accelerated in case a candidate mastery effect grants a skill.
+		local fastCalcOptions = { requirementsItems = true, requirementsGems = true, skipEHP = true }
+
 		local bestNode, bestDensity, bestMasteryChoice, bestPathLength
 
 		-- Mastery nodes need their own evaluation (see bestMasteryEffectForHitDps); cap how many are
@@ -1455,7 +1460,7 @@ function PassiveSpecClass:MaximizeHitDamage(progressCallback)
 				break
 			end
 			masteryCandidateCount = masteryCandidateCount + 1
-			local effectId, dps = bestMasteryEffectForHitDps(self, node, calcFunc, calcBase)
+			local effectId, dps = bestMasteryEffectForHitDps(self, node, calcFunc, calcBase, fastCalcOptions)
 			if effectId and dps and dps > 0 then
 				local density = dps / #node.path
 				if not bestDensity or density > bestDensity then
