@@ -1316,7 +1316,7 @@ function PassiveSpecClass:FixAttributeRequirements(reqStr, reqDex, reqInt, progr
 		local guard = 0
 		while guard < 40 do
 			guard = guard + 1
-			calcsTab:BuildOutput()
+			calcsTab:RefreshForOptimizer()
 			local have = calcsTab.mainOutput[attributeStatByIndex[attributeIndex]] or 0
 			if have >= reqByIndex[attributeIndex] then
 				break
@@ -1377,15 +1377,18 @@ function PassiveSpecClass:MaximizeHitDamage(progressCallback)
 	-- Make sure the calculator reflects the spec as it stands right now, and capture the attribute
 	-- requirements from equipped items/gems before we start changing anything (these don't depend on
 	-- the passive tree, so they won't change as we go).
-	calcsTab:BuildOutput()
+	calcsTab:RefreshForOptimizer()
 	local reqStr = calcsTab.mainOutput.ReqStr or 0
 	local reqDex = calcsTab.mainOutput.ReqDex or 0
 	local reqInt = calcsTab.mainOutput.ReqInt or 0
 
-	-- Search the full tree regardless of the heat map's own depth-limit setting, and restore it after.
+	-- Override the heat map's own depth-limit setting while we work (restored after): nothing farther
+	-- than the points remaining could ever be affordable anyway, so the search radius is capped to the
+	-- remaining budget each pass below instead of scanning the whole tree every time. This is the single
+	-- biggest cost in this function - evaluating a 10-point search across a 1000+ node tree instead of
+	-- the ~10-deep neighbourhood that's actually reachable is what makes it slow.
 	local savedMaxDepth = calcsTab.nodePowerMaxDepth
 	local savedPowerStat = calcsTab.powerStat
-	calcsTab.nodePowerMaxDepth = nil
 	local hitDpsStat = { stat = "TotalDPS" }
 
 	-- Points currently spent on nodes we're allowed to touch; this is our budget.
@@ -1427,13 +1430,14 @@ function PassiveSpecClass:MaximizeHitDamage(progressCallback)
 	-- least one point.
 	local pointsSpent = 0
 	while pointsSpent < pointsAvailable do
-		calcsTab:BuildOutput()
+		local pointsRemaining = pointsAvailable - pointsSpent
+		calcsTab:RefreshForOptimizer()
 		local calcFunc, calcBase = calcsTab:GetMiscCalculator()
 		calcsTab.powerStat = hitDpsStat
-		calcsTab:PowerBuilder() -- populates node.power.pathPower for every other reachable unallocated node
+		calcsTab.nodePowerMaxDepth = pointsRemaining
+		calcsTab:PowerBuilder() -- populates node.power.pathPower for every reachable-within-budget unallocated node
 		yield()
 
-		local pointsRemaining = pointsAvailable - pointsSpent
 		local bestNode, bestDensity, bestMasteryChoice, bestPathLength
 
 		-- Mastery nodes need their own evaluation (see bestMasteryEffectForHitDps); cap how many are

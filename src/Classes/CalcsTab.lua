@@ -526,6 +526,24 @@ function CalcsTabClass:BuildOutput(validateWeaponSets)
 	self.miscCalculator = { miscCalcFunc, miscCalcBase }
 end
 
+-- A much lighter-weight stand-in for BuildOutput(), for background loops (e.g.
+-- PassiveSpecClass:MaximizeHitDamage) that just need PowerBuilder()/GetMiscCalculator() to reflect the
+-- current spec and don't care about anything currently on screen. Skips the "CALCS"-mode pass (used
+-- only for the Calcs tab breakdown), the breakdown panel refresh, the sidebar/socket-group label text,
+-- and weapon-set reconciliation (which only affects which socket group's stats are shown) - none of
+-- which PowerBuilder or the misc calculator read. This alone cuts out roughly one of the three full
+-- calculation passes BuildOutput() does, with no change in the numbers either one produces.
+function CalcsTabClass:RefreshForOptimizer()
+	self.powerBuildFlag = true
+	for _, node in pairs(self.build.spec.nodes) do
+		node.finalModList = node.modList
+	end
+	self.mainEnv = self.calcs.buildOutput(self.build, "MAIN")
+	self.mainOutput = self.mainEnv.player.output
+	local miscCalcFunc, miscCalcBase = self.calcs.getMiscCalculator(self.build)
+	self.miscCalculator = { miscCalcFunc, miscCalcBase }
+end
+
 -- Controls the coroutine that calculates node power
 function CalcsTabClass:BuildPower()
 	if self.powerBuildFlag then
